@@ -192,6 +192,7 @@ impl BlockChain {
             pending_blocks: HashMap::new(),
             aggregator,
             pending_block_parents: HashMap::new(),
+            invalid_blocks: HashMap::new(),
             current_aggregation: None,
             last_tick_instant: None,
             attestation_committee_count,
@@ -273,6 +274,16 @@ pub struct BlockChainServer {
     // chain at lookup time, since a cached ancestor may itself have become pending with
     // a deeper missing parent after the entry was created.
     pending_block_parents: HashMap<H256, H256>,
+
+    /// Roots of blocks that failed the state transition, with their slots.
+    ///
+    /// A child of one of these can never import, so it is rejected instead of
+    /// stored as pending. Only state transition failures are recorded: they
+    /// depend on the block message alone, which the root commits to, and the
+    /// block already passed signature verification, so only a misbehaving
+    /// validator can add an entry. Entries at or below the finalized slot are
+    /// pruned, since blocks there are rejected by slot anyway.
+    invalid_blocks: HashMap<H256, u64>,
 
     /// Whether this node acts as a committee aggregator.
     ///
@@ -969,6 +980,13 @@ impl BlockChainServer {
         self.store
             .prune_old_data()
             .expect("DB pruning should succeed");
+
+        let finalized_slot = self
+            .store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists")
+            .slot;
+        self.prune_invalid_blocks(finalized_slot);
     }
 
     /// Try to process a single block. If its parent state is missing, store it
@@ -1029,6 +1047,17 @@ impl BlockChainServer {
             // can be checked without the parent state before storing. A
             // rejected block can never import, and neither can any children
             // that arrived ahead of it.
+            if self.invalid_blocks.contains_key(&parent_root) {
+                warn!(
+                    %slot,
+                    proposer,
+                    block_root = %ShortRoot(&block_root.0),
+                    parent_root = %ShortRoot(&parent_root.0),
+                    "Rejecting block: parent failed the state transition"
+                );
+                self.discard_pending_subtree(block_root);
+                return;
+            }
             if let Err(err) = store::validate_pending_block(&self.store, &signed_block) {
                 warn!(
                     %slot,
@@ -1140,6 +1169,7 @@ impl BlockChainServer {
                     %err,
                     "Failed to process block"
                 );
+                self.on_import_failure(block_root, slot, &err);
             }
         }
     }
@@ -1210,6 +1240,30 @@ impl BlockChainServer {
 
             queue.push_back(child_block);
         }
+    }
+
+    /// React to a block whose import failed with `err`.
+    ///
+    /// Only a state transition failure condemns the root: it depends on the
+    /// block message alone, which the root commits to. The block is recorded
+    /// as invalid, and it and any children waiting on it are discarded along
+    /// with their rows.
+    ///
+    /// Every other failure is left alone. Some depend on the proof, which the
+    /// root does not cover, so a bad copy of a real block would otherwise
+    /// condemn the real one. Others depend on time, and may pass later.
+    fn on_import_failure(&mut self, block_root: H256, slot: u64, err: &StoreError) {
+        if !matches!(err, StoreError::StateTransitionFailed(_)) {
+            return;
+        }
+        self.invalid_blocks.insert(block_root, slot);
+        self.discard_pending_subtree(block_root);
+    }
+
+    /// Forget invalid blocks at or below `finalized_slot`. Blocks there are
+    /// rejected by slot before the invalid set is consulted.
+    fn prune_invalid_blocks(&mut self, finalized_slot: u64) {
+        self.invalid_blocks.retain(|_, slot| *slot > finalized_slot);
     }
 
     /// Recursively discard a block and all its pending descendants.
@@ -1666,6 +1720,7 @@ mod tests {
             key_manager: key_manager::KeyManager::new(HashMap::new()),
             pending_blocks: HashMap::new(),
             pending_block_parents: HashMap::new(),
+            invalid_blocks: HashMap::new(),
             aggregator: AggregatorController::new(false),
             current_aggregation: None,
             last_tick_instant: None,
@@ -1835,6 +1890,116 @@ mod tests {
         );
         assert!(server.pending_blocks.is_empty());
         assert!(server.pending_block_parents.is_empty());
+    }
+
+    /// Pend `child(6)` under `parent_root`, which is never stored, and return
+    /// the child's root.
+    fn pend_child_of(server: &mut BlockChainServer, parent_root: H256) -> H256 {
+        let child = empty_block(6, parent_root);
+        let child_root = child.message.hash_tree_root();
+        server.on_block(child);
+        assert!(
+            server
+                .store
+                .get_block_header(&child_root)
+                .unwrap()
+                .is_some()
+        );
+        child_root
+    }
+
+    /// A state transition failure that depends on the message alone.
+    fn state_transition_failure() -> StoreError {
+        StoreError::StateTransitionFailed(ethlambda_state_transition::Error::StateRootMismatch {
+            expected: H256::ZERO,
+            computed: H256([1; 32]),
+        })
+    }
+
+    /// A block whose parent already failed the state transition can never
+    /// import, so it is neither stored nor pended.
+    #[test]
+    fn child_of_invalid_block_is_rejected() {
+        let mut server = test_server(pending_test_store());
+        let invalid_root = H256([0xCD; 32]);
+        server.invalid_blocks.insert(invalid_root, 5);
+        let child = empty_block(6, invalid_root);
+        let child_root = child.message.hash_tree_root();
+
+        server.on_block(child);
+
+        assert!(
+            server
+                .store
+                .get_block_header(&child_root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(server.pending_blocks.is_empty());
+        assert!(server.pending_block_parents.is_empty());
+    }
+
+    /// A state transition failure is bound to the root, so the block is
+    /// remembered as invalid and the children waiting on it are discarded.
+    #[test]
+    fn state_transition_failure_marks_block_invalid_and_discards_children() {
+        let mut server = test_server(pending_test_store());
+        let failed_root = H256([0xCD; 32]);
+        let child_root = pend_child_of(&mut server, failed_root);
+
+        server.on_import_failure(failed_root, 5, &state_transition_failure());
+
+        assert_eq!(server.invalid_blocks.get(&failed_root), Some(&5));
+        assert!(
+            server
+                .store
+                .get_block_header(&child_root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(server.pending_blocks.is_empty());
+        assert!(server.pending_block_parents.is_empty());
+    }
+
+    /// The root does not cover the proof, so a copy of a real block with a
+    /// bad proof fails verification under the real block's root. That
+    /// failure must not mark the root invalid or drop its children, or anyone
+    /// could kill a real block by racing a bad copy of it.
+    #[test]
+    fn signature_failure_neither_marks_invalid_nor_discards_children() {
+        let mut server = test_server(pending_test_store());
+        let failed_root = H256([0xCD; 32]);
+        let child_root = pend_child_of(&mut server, failed_root);
+
+        server.on_import_failure(failed_root, 5, &StoreError::SignatureVerificationFailed);
+
+        assert!(server.invalid_blocks.is_empty());
+        assert!(
+            server
+                .store
+                .get_block_header(&child_root)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            server.pending_block_parents.get(&child_root),
+            Some(&failed_root)
+        );
+    }
+
+    /// Entries at or below the finalized slot are dropped; later ones stay.
+    #[test]
+    fn invalid_blocks_are_pruned_at_finalization() {
+        let mut server = test_server(pending_test_store());
+        let at_finalized = H256([1; 32]);
+        let above_finalized = H256([2; 32]);
+        server.invalid_blocks.insert(at_finalized, 5);
+        server.invalid_blocks.insert(above_finalized, 6);
+
+        server.prune_invalid_blocks(5);
+
+        assert!(!server.invalid_blocks.contains_key(&at_finalized));
+        assert!(server.invalid_blocks.contains_key(&above_finalized));
     }
 
     /// The subtree root can be an imported block, such as one at or below the
