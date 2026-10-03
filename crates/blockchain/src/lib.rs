@@ -1783,20 +1783,35 @@ mod tests {
         }
     }
 
+    /// Record `block` as pending the way the pending path does, with
+    /// `missing_root` as its deepest missing ancestor, and return its root.
+    ///
+    /// Bypasses validation on purpose: a block can only pass the signature
+    /// check with a real proof from the leanVM prover, so tests that need a
+    /// block already pending set the state up directly.
+    fn insert_pending(
+        server: &mut BlockChainServer,
+        block: SignedBlock,
+        missing_root: H256,
+    ) -> H256 {
+        let root = block.message.hash_tree_root();
+        let parent_root = block.message.parent_root;
+        server.store.insert_pending_block(root, block).unwrap();
+        server
+            .pending_blocks
+            .entry(parent_root)
+            .or_default()
+            .insert(root);
+        server.pending_block_parents.insert(root, missing_root);
+        root
+    }
+
     /// Pend `a(5) <- b(6)` under a parent that is never stored, returning
     /// `(missing_root, root_a, root_b)`.
     fn pend_two_block_chain(server: &mut BlockChainServer) -> (H256, H256, H256) {
         let missing_root = H256([0xAB; 32]);
-        let block_a = empty_block(5, missing_root);
-        let root_a = block_a.message.hash_tree_root();
-        let block_b = empty_block(6, root_a);
-        let root_b = block_b.message.hash_tree_root();
-
-        server.on_block(block_a);
-        server.on_block(block_b);
-
-        assert!(server.store.get_block_header(&root_a).unwrap().is_some());
-        assert!(server.store.get_block_header(&root_b).unwrap().is_some());
+        let root_a = insert_pending(server, empty_block(5, missing_root), missing_root);
+        let root_b = insert_pending(server, empty_block(6, root_a), missing_root);
         (missing_root, root_a, root_b)
     }
 
@@ -1860,17 +1875,7 @@ mod tests {
         let mut parent = empty_block(5, H256([0xAB; 32]));
         parent.message.proposer_index = 2;
         let parent_root = parent.message.hash_tree_root();
-        let child = empty_block(6, parent_root);
-        let child_root = child.message.hash_tree_root();
-
-        server.on_block(child);
-        assert!(
-            server
-                .store
-                .get_block_header(&child_root)
-                .unwrap()
-                .is_some()
-        );
+        let child_root = insert_pending(&mut server, empty_block(6, parent_root), parent_root);
 
         server.on_block(parent);
 
@@ -1895,17 +1900,7 @@ mod tests {
     /// Pend `child(6)` under `parent_root`, which is never stored, and return
     /// the child's root.
     fn pend_child_of(server: &mut BlockChainServer, parent_root: H256) -> H256 {
-        let child = empty_block(6, parent_root);
-        let child_root = child.message.hash_tree_root();
-        server.on_block(child);
-        assert!(
-            server
-                .store
-                .get_block_header(&child_root)
-                .unwrap()
-                .is_some()
-        );
-        child_root
+        insert_pending(server, empty_block(6, parent_root), parent_root)
     }
 
     /// A state transition failure that depends on the message alone.

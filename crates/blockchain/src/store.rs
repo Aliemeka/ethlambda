@@ -1164,6 +1164,17 @@ pub enum StoreError {
 /// finalized one. The registry is fixed at genesis, so both give the same
 /// answer, and the head state is almost always in the state cache.
 pub fn validate_pending_block(store: &Store, signed_block: &SignedBlock) -> Result<(), StoreError> {
+    validate_pending_block_core(store, signed_block, true)
+}
+
+/// [`validate_pending_block`], with the signature check skipped when `verify`
+/// is false. Mirrors [`on_block_core`]: only tests skip verification, since a
+/// real proof needs the leanVM prover.
+fn validate_pending_block_core(
+    store: &Store,
+    signed_block: &SignedBlock,
+    verify: bool,
+) -> Result<(), StoreError> {
     let block = &signed_block.message;
     let parent_root = block.parent_root;
 
@@ -1174,7 +1185,8 @@ pub fn validate_pending_block(store: &Store, signed_block: &SignedBlock) -> Resu
 
     validate_block_attestations(block)?;
 
-    let num_validators = store.head_state().validators.len() as u64;
+    let head_state = store.head_state();
+    let num_validators = head_state.validators.len() as u64;
     if !is_proposer(block.proposer_index, block.slot, num_validators) {
         return Err(StoreError::NotProposer {
             validator_index: block.proposer_index,
@@ -1186,28 +1198,35 @@ pub fn validate_pending_block(store: &Store, signed_block: &SignedBlock) -> Resu
     // The parent's header is on disk when it is itself pending, which is how
     // a deep gap is filled. Its slot and position relative to finality are
     // then known even though its state is not.
-    let Some(parent) = store
+    if let Some(parent) = store
         .get_block_header(&parent_root)
         .expect("DB read should succeed")
-    else {
-        return Ok(());
-    };
-    if block.slot <= parent.slot {
-        return Err(StoreError::ParentSlotNotBefore {
-            block_slot: block.slot,
-            parent_slot: parent.slot,
-        });
+    {
+        if block.slot <= parent.slot {
+            return Err(StoreError::ParentSlotNotBefore {
+                block_slot: block.slot,
+                parent_slot: parent.slot,
+            });
+        }
+        let finalized = store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists");
+        if parent.slot <= finalized.slot && parent_root != finalized.root {
+            return Err(StoreError::ParentConflictsWithFinalized {
+                parent_root,
+                parent_slot: parent.slot,
+                finalized_root: finalized.root,
+                finalized_slot: finalized.slot,
+            });
+        }
     }
-    let finalized = store
-        .latest_finalized()
-        .expect("latest finalized checkpoint exists");
-    if parent.slot <= finalized.slot && parent_root != finalized.root {
-        return Err(StoreError::ParentConflictsWithFinalized {
-            parent_root,
-            parent_slot: parent.slot,
-            finalized_root: finalized.root,
-            finalized_slot: finalized.slot,
-        });
+
+    // Last, since it is by far the most expensive check: a forged block is
+    // turned away by everything above without reaching the SNARK verifier.
+    // Signature verification reads only the registry, which the head state
+    // shares with any other. Import verifies again once the parent arrives.
+    if verify {
+        verify_block_signatures(&head_state, signed_block)?;
     }
 
     Ok(())
@@ -2337,6 +2356,8 @@ mod tests {
         block
     }
 
+    /// Passes every check but the signature, which a placeholder proof cannot
+    /// satisfy, so verification is skipped here.
     #[test]
     fn validate_pending_block_accepts_well_formed_orphan() {
         let store = pending_test_store();
@@ -2345,13 +2366,14 @@ mod tests {
             vec![attestation_at(4, &[0, 3])],
         );
 
-        let result = validate_pending_block(&store, &block);
+        let result = validate_pending_block_core(&store, &block, false);
 
         assert!(result.is_ok(), "Expected Ok, got: {result:?}");
     }
 
     /// The normal deep-gap case: the parent is itself pending, stored but
-    /// without a state, at an earlier slot above finality.
+    /// without a state, at an earlier slot above finality. Verification is
+    /// skipped, as above.
     #[test]
     fn validate_pending_block_accepts_child_of_pending_parent() {
         let mut store = pending_test_store();
@@ -2359,9 +2381,25 @@ mod tests {
         let parent_root = parent.message.hash_tree_root();
         store.insert_pending_block(parent_root, parent).unwrap();
 
-        let result = validate_pending_block(&store, &orphan_block(6, parent_root));
+        let block = orphan_block(6, parent_root);
+        let result = validate_pending_block_core(&store, &block, false);
 
         assert!(result.is_ok(), "Expected Ok, got: {result:?}");
+    }
+
+    /// A block that passes every cheap check but carries no valid proof is a
+    /// forgery as far as we can tell, and must not be stored.
+    #[test]
+    fn validate_pending_block_rejects_invalid_proof() {
+        ethlambda_crypto::init_leanvm(false);
+        let store = pending_test_store();
+
+        let result = validate_pending_block(&store, &orphan_block(5, UNKNOWN_PARENT));
+
+        assert!(
+            matches!(result, Err(StoreError::BlockProofVerificationFailed(_))),
+            "Expected BlockProofVerificationFailed, got: {result:?}"
+        );
     }
 
     #[test]
