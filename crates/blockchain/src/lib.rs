@@ -1025,6 +1025,23 @@ impl BlockChainServer {
             .has_state(&parent_root)
             .expect("DB read should succeed")
         {
+            // Pending blocks are persisted and served to peers, so check what
+            // can be checked without the parent state before storing. A
+            // rejected block can never import, and neither can any children
+            // that arrived ahead of it.
+            if let Err(err) = store::validate_pending_block(&self.store, &signed_block) {
+                warn!(
+                    %slot,
+                    proposer,
+                    block_root = %ShortRoot(&block_root.0),
+                    parent_root = %ShortRoot(&parent_root.0),
+                    %err,
+                    "Rejecting block with missing parent"
+                );
+                self.discard_pending_subtree(block_root);
+                return;
+            }
+
             info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
 
             // Resolve the actual missing ancestor by walking the chain. A stale entry
@@ -1667,11 +1684,28 @@ mod tests {
         }
     }
 
-    /// Store anchored at an empty genesis, with the clock far enough ahead
-    /// that the test blocks' slots have already started.
+    /// Registry size for the pending-block tests: the proposer for slot `s` is
+    /// `s % PENDING_VALIDATORS`.
+    const PENDING_VALIDATORS: u64 = 4;
+
+    /// A registry of `count` validators with placeholder keys, enough for the
+    /// proposer and index checks, which never decode a key.
+    fn make_validators(count: u64) -> Vec<ethlambda_types::state::Validator> {
+        (0..count)
+            .map(|index| ethlambda_types::state::Validator {
+                attestation_pubkey: ethlambda_types::state::ValidatorPubkeyBytes::default(),
+                proposal_pubkey: ethlambda_types::state::ValidatorPubkeyBytes::default(),
+                index,
+            })
+            .collect()
+    }
+
+    /// Store anchored at a genesis of `PENDING_VALIDATORS` validators, with
+    /// the clock far enough ahead that the test blocks' slots have started.
     fn pending_test_store() -> Store {
         let backend = Arc::new(InMemoryBackend::new());
-        let genesis_state = State::from_genesis(GENESIS_TIME, vec![]);
+        let validators = make_validators(PENDING_VALIDATORS);
+        let genesis_state = State::from_genesis(GENESIS_TIME, validators);
         let mut store =
             Store::from_anchor_state(backend, genesis_state, DEFAULT_MILLISECONDS_PER_SLOT);
         store
@@ -1680,11 +1714,12 @@ mod tests {
         store
     }
 
+    /// An empty-bodied block from the slot's proposer.
     fn empty_block(slot: u64, parent_root: H256) -> SignedBlock {
         SignedBlock {
             message: Block {
                 slot,
-                proposer_index: 0,
+                proposer_index: slot % PENDING_VALIDATORS,
                 parent_root,
                 state_root: H256::ZERO,
                 body: BlockBody::default(),
@@ -1736,6 +1771,70 @@ mod tests {
 
         assert!(server.store.get_block_header(&root_a).unwrap().is_none());
         assert!(server.store.get_block_header(&root_b).unwrap().is_none());
+    }
+
+    /// An orphan that fails pending validation is neither written to disk nor
+    /// tracked in the pending maps, and no parent fetch is started for it.
+    #[test]
+    fn invalid_orphan_is_neither_stored_nor_pended() {
+        let mut server = test_server(pending_test_store());
+        let mut block = empty_block(5, H256([0xAB; 32]));
+        // Slot 5's proposer is 1; validator 2 is out of turn.
+        block.message.proposer_index = 2;
+        let block_root = block.message.hash_tree_root();
+
+        server.on_block(block);
+
+        assert!(
+            server
+                .store
+                .get_block_header(&block_root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(server.pending_blocks.is_empty());
+        assert!(server.pending_block_parents.is_empty());
+    }
+
+    /// Children can arrive before their parent. When the parent turns out to
+    /// be invalid, the children already waiting on it can never import, so
+    /// they are discarded along with their rows.
+    #[test]
+    fn invalid_orphan_discards_its_waiting_children() {
+        let mut server = test_server(pending_test_store());
+        let mut parent = empty_block(5, H256([0xAB; 32]));
+        parent.message.proposer_index = 2;
+        let parent_root = parent.message.hash_tree_root();
+        let child = empty_block(6, parent_root);
+        let child_root = child.message.hash_tree_root();
+
+        server.on_block(child);
+        assert!(
+            server
+                .store
+                .get_block_header(&child_root)
+                .unwrap()
+                .is_some()
+        );
+
+        server.on_block(parent);
+
+        assert!(
+            server
+                .store
+                .get_block_header(&parent_root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            server
+                .store
+                .get_block_header(&child_root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(server.pending_blocks.is_empty());
+        assert!(server.pending_block_parents.is_empty());
     }
 
     /// The subtree root can be an imported block, such as one at or below the
