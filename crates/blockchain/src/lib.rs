@@ -1199,7 +1199,15 @@ impl BlockChainServer {
     ///
     /// Used when a block is rejected (e.g., at/below finalized slot) to clean up
     /// children that would otherwise remain stuck in the pending maps indefinitely.
+    ///
+    /// Each discarded block's stored rows are deleted too, so peers stop being
+    /// served blocks we will never import. `delete_pending_block` leaves any
+    /// block with a state alone, which matters here: the root can be an
+    /// already-imported block at or below the finalized slot.
     fn discard_pending_subtree(&mut self, block_root: H256) {
+        self.store
+            .delete_pending_block(&block_root)
+            .expect("DB delete should succeed");
         let Some(child_roots) = self.pending_blocks.remove(&block_root) else {
             return;
         };
@@ -1620,6 +1628,131 @@ mod tests {
         assert_eq!(
             aggregation_deadline(config.milliseconds_per_interval()),
             Duration::from_millis(1_600)
+        );
+    }
+
+    // ============ Pending Block Tests ============
+
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::{
+        block::{Block, BlockBody, MultiMessageAggregate},
+        state::State,
+    };
+    use std::sync::Arc;
+
+    /// Actor with no validators, no P2P handle, and default policies around
+    /// `store`. Enough to drive block import and the pending-block maps.
+    fn test_server(store: Store) -> BlockChainServer {
+        BlockChainServer {
+            store,
+            p2p: None,
+            key_manager: key_manager::KeyManager::new(HashMap::new()),
+            pending_blocks: HashMap::new(),
+            pending_block_parents: HashMap::new(),
+            aggregator: AggregatorController::new(false),
+            current_aggregation: None,
+            last_tick_instant: None,
+            attestation_committee_count: 1,
+            subscribed_subnets: HashSet::new(),
+            aggregation_duty_subnet: 0,
+            skip_redundant_aggregation: false,
+            proposer_config: ProposerConfig {
+                enable_proposer_aggregation: false,
+                max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+            },
+            pre_merge_coverage: None,
+            sync_status: SyncStatusTracker::new(false),
+            sync_status_controller: SyncStatusController::default(),
+            events: EventBus::default(),
+        }
+    }
+
+    /// Store anchored at an empty genesis, with the clock far enough ahead
+    /// that the test blocks' slots have already started.
+    fn pending_test_store() -> Store {
+        let backend = Arc::new(InMemoryBackend::new());
+        let genesis_state = State::from_genesis(GENESIS_TIME, vec![]);
+        let mut store =
+            Store::from_anchor_state(backend, genesis_state, DEFAULT_MILLISECONDS_PER_SLOT);
+        store
+            .set_time(100 * INTERVALS_PER_SLOT)
+            .expect("set store time");
+        store
+    }
+
+    fn empty_block(slot: u64, parent_root: H256) -> SignedBlock {
+        SignedBlock {
+            message: Block {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        }
+    }
+
+    /// Pend `a(5) <- b(6)` under a parent that is never stored, returning
+    /// `(missing_root, root_a, root_b)`.
+    fn pend_two_block_chain(server: &mut BlockChainServer) -> (H256, H256, H256) {
+        let missing_root = H256([0xAB; 32]);
+        let block_a = empty_block(5, missing_root);
+        let root_a = block_a.message.hash_tree_root();
+        let block_b = empty_block(6, root_a);
+        let root_b = block_b.message.hash_tree_root();
+
+        server.on_block(block_a);
+        server.on_block(block_b);
+
+        assert!(server.store.get_block_header(&root_a).unwrap().is_some());
+        assert!(server.store.get_block_header(&root_b).unwrap().is_some());
+        (missing_root, root_a, root_b)
+    }
+
+    /// Discarding a pending subtree drops its blocks from disk as well as from
+    /// the in-memory maps, so they stop being served over BlocksByRoot.
+    #[test]
+    fn discard_pending_subtree_deletes_descendant_rows() {
+        let mut server = test_server(pending_test_store());
+        let (missing_root, root_a, root_b) = pend_two_block_chain(&mut server);
+
+        server.discard_pending_subtree(missing_root);
+
+        assert!(server.store.get_block_header(&root_a).unwrap().is_none());
+        assert!(server.store.get_block_header(&root_b).unwrap().is_none());
+        assert!(server.pending_blocks.is_empty());
+        assert!(server.pending_block_parents.is_empty());
+    }
+
+    /// A pending block whose slot finalization has passed is discarded when
+    /// its parent finally lands. Its own rows go too, not only its children's.
+    #[test]
+    fn discard_pending_subtree_deletes_pending_root_rows() {
+        let mut server = test_server(pending_test_store());
+        let (_missing_root, root_a, root_b) = pend_two_block_chain(&mut server);
+
+        server.discard_pending_subtree(root_a);
+
+        assert!(server.store.get_block_header(&root_a).unwrap().is_none());
+        assert!(server.store.get_block_header(&root_b).unwrap().is_none());
+    }
+
+    /// The subtree root can be an imported block, such as one at or below the
+    /// finalized slot that arrives again. Its rows must survive the discard.
+    #[test]
+    fn discard_pending_subtree_keeps_imported_root() {
+        let mut server = test_server(pending_test_store());
+        let anchor_root = server.store.head().expect("head root");
+
+        server.discard_pending_subtree(anchor_root);
+
+        assert!(
+            server
+                .store
+                .get_block_header(&anchor_root)
+                .unwrap()
+                .is_some()
         );
     }
 }
