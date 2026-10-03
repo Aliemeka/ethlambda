@@ -678,24 +678,7 @@ fn on_block_core(
         });
     }
 
-    // Each unique AttestationData must appear at most once per block.
-    let attestations = &signed_block.message.body.attestations;
-    let mut seen = HashSet::with_capacity(attestations.len());
-    for att in attestations {
-        if !seen.insert(&att.data) {
-            return Err(StoreError::DuplicateAttestationData {
-                count: attestations.len(),
-                unique: seen.len(),
-            });
-        }
-    }
-    // Reject blocks exceeding the per-block distinct-attestation-data cap (leanSpec #536).
-    if seen.len() > MAX_ATTESTATIONS_DATA {
-        return Err(StoreError::TooManyAttestationData {
-            count: seen.len(),
-            max: MAX_ATTESTATIONS_DATA,
-        });
-    }
+    validate_block_attestations(&signed_block.message)?;
 
     let sig_verification_start = std::time::Instant::now();
     if verify {
@@ -1149,6 +1132,57 @@ pub enum StoreError {
     BlockTooFarInFuture { block_slot: u64, current_slot: u64 },
 }
 
+/// Reject a block body that repeats an `AttestationData` or carries more
+/// distinct ones than `MAX_ATTESTATIONS_DATA` (leanSpec #536).
+///
+/// A repeated entry would let one block count the same validators' votes more
+/// than once. Needs nothing but the block itself.
+fn validate_block_attestations(block: &Block) -> Result<(), StoreError> {
+    let attestations = &block.body.attestations;
+    let mut seen = HashSet::with_capacity(attestations.len());
+    for att in attestations {
+        if !seen.insert(&att.data) {
+            return Err(StoreError::DuplicateAttestationData {
+                count: attestations.len(),
+                unique: seen.len(),
+            });
+        }
+    }
+    if seen.len() > MAX_ATTESTATIONS_DATA {
+        return Err(StoreError::TooManyAttestationData {
+            count: seen.len(),
+            max: MAX_ATTESTATIONS_DATA,
+        });
+    }
+    Ok(())
+}
+
+/// Reject a block naming a validator outside a registry of `num_validators`:
+/// any participant bit in an attestation, or the proposer.
+///
+/// Attesters are checked first, then the proposer, and each gets its own
+/// error, since the spec names them distinctly (`VALIDATOR_INDEX_OUT_OF_RANGE`
+/// vs `PROPOSER_INDEX_OUT_OF_RANGE`).
+fn validate_validator_indices(block: &Block, num_validators: u64) -> Result<(), StoreError> {
+    for attestation in block.body.attestations.iter() {
+        for vid in validator_indices(&attestation.aggregation_bits) {
+            if vid >= num_validators {
+                return Err(StoreError::AttesterIndexOutOfRange {
+                    validator_index: vid,
+                    num_validators,
+                });
+            }
+        }
+    }
+    if block.proposer_index >= num_validators {
+        return Err(StoreError::ProposerIndexOutOfRange {
+            proposer_index: block.proposer_index,
+            num_validators,
+        });
+    }
+    Ok(())
+}
+
 /// Full verification of a signed block's merged multi-message aggregate proof.
 ///
 /// Structural pre-checks (fast fail) bound the body itself: attestation count,
@@ -1179,22 +1213,7 @@ pub fn verify_block_signatures(
     // Per-component pubkeys are resolved from the block body itself; the
     // wire proof carries no separate participant declaration to cross-check
     // against (leanSpec PR #717).
-    for attestation in attestations.iter() {
-        for vid in validator_indices(&attestation.aggregation_bits) {
-            if vid >= num_validators {
-                return Err(StoreError::AttesterIndexOutOfRange {
-                    validator_index: vid,
-                    num_validators,
-                });
-            }
-        }
-    }
-    if block.proposer_index >= num_validators {
-        return Err(StoreError::ProposerIndexOutOfRange {
-            proposer_index: block.proposer_index,
-            num_validators,
-        });
-    }
+    validate_validator_indices(block, num_validators)?;
 
     let block_root = block.hash_tree_root();
     let structural_elapsed = total_start.elapsed();
@@ -1458,6 +1477,49 @@ mod tests {
                 })
             ),
             "Expected DuplicateAttestationData, got: {result:?}"
+        );
+    }
+
+    /// One more distinct `AttestationData` than the cap is rejected before the
+    /// state transition runs.
+    #[test]
+    fn on_block_rejects_too_many_attestation_data() {
+        let mut store = new_test_store();
+        let head_root = store.head().expect("store head exists");
+
+        // Distinct entries: each names a different slot.
+        let entries: Vec<AggregatedAttestation> = (0..=MAX_ATTESTATIONS_DATA as u64)
+            .map(|slot| AggregatedAttestation {
+                aggregation_bits: make_bits(&[0]),
+                data: AttestationData {
+                    slot,
+                    head: Checkpoint::default(),
+                    target: Checkpoint::default(),
+                    source: Checkpoint::default(),
+                },
+            })
+            .collect();
+        let signed_block = SignedBlock {
+            message: Block {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: head_root,
+                state_root: H256::ZERO,
+                body: BlockBody {
+                    attestations: AggregatedAttestations::try_from(entries).unwrap(),
+                },
+            },
+            proof: MultiMessageAggregate::default(),
+        };
+
+        let result = on_block_without_verification(&mut store, signed_block);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::TooManyAttestationData { count, max })
+                    if count == MAX_ATTESTATIONS_DATA + 1 && max == MAX_ATTESTATIONS_DATA
+            ),
+            "Expected TooManyAttestationData, got: {result:?}"
         );
     }
 
